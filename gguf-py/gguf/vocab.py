@@ -24,8 +24,13 @@ try:
     )
 except ImportError:
     _mistral_common_installed = False
+    MistralTokenizer = None
+    Tekkenizer = None
+    SentencePieceTokenizer = None
+    _filter_valid_tokenizer_files = None
 else:
     _mistral_common_installed = True
+
 
 import gguf
 
@@ -617,7 +622,7 @@ class MistralTokenizerType(str, Enum):
 # Copied from Transformers (Apache 2.0)
 # https://github.com/huggingface/transformers/blob/main/src/transformers/convert_slow_tokenizer.py#L1544
 
-def bytes_to_unicode():
+def bytes_to_unicode() -> dict[int, str]:
     """
     Returns list of utf-8 byte and a mapping to unicode strings. We specifically avoids mapping to whitespace/control
     characters the bpe code barfs on.
@@ -639,8 +644,8 @@ def bytes_to_unicode():
             bs.append(b)
             cs.append(2**8 + n)
             n += 1
-    cs = [chr(n) for n in cs]
-    return dict(zip(bs, cs))
+    cs_str = [chr(n) for n in cs]
+    return dict(zip(bs, cs_str))
 
 
 class MistralVocab(Vocab):
@@ -656,6 +661,11 @@ class MistralVocab(Vocab):
                 "To use MistralVocab, please install the `mistral-common` package. "
                 "You can install it with `pip install mistral-common`."
             )
+        assert _filter_valid_tokenizer_files is not None, "mistral_common is not installed"
+        assert MistralTokenizer is not None, "mistral_common is not installed"
+        assert Tekkenizer is not None, "mistral_common is not installed"
+
+        logger.info(f"Loading Mistral tokenizer from {base_path}")
 
         # Find the tokenizer files
         all_files = [f.as_posix() for f in base_path.glob("**/*") if f.is_file()]
@@ -698,6 +708,7 @@ class MistralVocab(Vocab):
         return "llama" if self.tokenizer_type == MistralTokenizerType.spm else "gpt2"
 
     def _sentencepiece_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
+        assert SentencePieceTokenizer is not None, "mistral_common is not installed"
         assert isinstance(self.tokenizer, SentencePieceTokenizer), (
             f"Expected SentencePieceTokenizer, got {type(self.tokenizer)}"
         )
@@ -720,26 +731,33 @@ class MistralVocab(Vocab):
 
             yield text, score, toktype
 
-    def _tekken_tokens(self) -> Iterable[tuple[str, float, gguf.TokenType]]:
+    def _tekken_tokens(self) -> Iterable[tuple[bytes, float, gguf.TokenType]]:
+        assert Tekkenizer is not None, "mistral_common is not installed"
         assert isinstance(self.tokenizer, Tekkenizer), (
             f"Expected Tekkenizer, got {type(self.tokenizer)}"
         )
 
         byte_encoder = bytes_to_unicode()
         for token_id in range(self.tokenizer.num_special_tokens):
-            token = self.tokenizer.id_to_piece(token_id)
-            yield token, 0, gguf.TokenType.CONTROL
+            yield (
+                self.tokenizer.id_to_piece(token_id).encode("utf-8"),
+                0,
+                gguf.TokenType.CONTROL
+            )
         for token in self.tokenizer._tekken_token2id_nospecial:
             yield (
-                self.token_bytes_to_string(token, byte_encoder),
+                self.token_bytes_to_string(token, byte_encoder).encode("utf-8"),
                 0,
                 gguf.TokenType.NORMAL,
             )
 
     def get_token_id(self, token: str) -> int:
+        assert SentencePieceTokenizer is not None and Tekkenizer is not None, "mistral_common is not installed"
         if self.tokenizer_type == MistralTokenizerType.spm:
+            assert isinstance(self.tokenizer, SentencePieceTokenizer)
             return self.tokenizer._vocab.index(token)
         elif self.tokenizer_type == MistralTokenizerType.tekken:
+            assert isinstance(self.tokenizer, Tekkenizer)
             return (
                 self.tokenizer._vocab.index(token) + self.tokenizer.num_special_tokens
             )
@@ -797,10 +815,9 @@ class MistralVocab(Vocab):
     def extract_vocab_merges_from_model(self):
         # Adapted from Transformers (Apache 2.0)
         # https://github.com/huggingface/transformers/blob/main/src/transformers/convert_slow_tokenizer.py
-        assert self.tokenizer_type == MistralTokenizerType.tekken, (
+        assert Tekkenizer is not None and isinstance(self.tokenizer, Tekkenizer), (
             f"Expected Tekkenizer, got {type(self.tokenizer)}"
         )
-
         mergeable_ranks = self.tokenizer._model._mergeable_ranks
         token_bytes_map = {
             rank: token_bytes for token_bytes, rank in mergeable_ranks.items()
@@ -822,7 +839,7 @@ class MistralVocab(Vocab):
                     local.append((left, right, i))
             if not local:
                 raise ValueError(
-                    f"Could not find valid merge for token at rank {i}: {merged_token}"
+                    f"Could not find valid merge for token at rank {i}: {merged_token.decode('latin-1')}"
                 )
             local = sorted(
                 local,
@@ -834,7 +851,7 @@ class MistralVocab(Vocab):
 
         byte_encoder = bytes_to_unicode()
 
-        merge_pairs = [
+        decoded_merge_pairs = [
             [
                 self.token_bytes_to_string(val[0], byte_encoder),
                 self.token_bytes_to_string(val[1], byte_encoder),
@@ -850,7 +867,7 @@ class MistralVocab(Vocab):
                     for part in pair
                 ]
             )
-            for pair in merge_pairs
+            for pair in decoded_merge_pairs
         ]
 
         return merges
